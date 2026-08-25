@@ -468,7 +468,10 @@ def translate_segments(segments: list[dict], source_lang: str, target_lang: str,
 
 
 def synthesize_voiceover(segments: list[dict], voice: str, workdir: str, logger: JobLogger) -> str:
-    """Edge-TTS per segment -> concatenated Bengali audio track."""
+    """Edge-TTS per segment -> concatenated target-language audio track.
+
+    Multi-character support: each segment may carry its own `voice` (assigned
+    by assign_character_voices) so different characters sound distinct."""
     import asyncio
     import edge_tts
 
@@ -479,17 +482,94 @@ def synthesize_voiceover(segments: list[dict], voice: str, workdir: str, logger:
             tasks.append((seg, out))
         os.makedirs(os.path.join(workdir, "tts"), exist_ok=True)
 
+        warned_voices: set[str] = set()
         for idx, (seg, out) in enumerate(tasks):
             # speed up slightly to fit the original timing
             rate = "+5%"
-            communicate = edge_tts.Communicate(seg["text"], voice, rate=rate)
-            await communicate.save(out)
+            seg_voice = seg.get("voice") or voice
+            # Robust fallback chain: assigned voice -> base voice -> English
+            for attempt_voice in (seg_voice, voice, "en-US-JennyNeural"):
+                try:
+                    communicate = edge_tts.Communicate(seg["text"], attempt_voice, rate=rate)
+                    await communicate.save(out)
+                    break
+                except Exception as e:
+                    if attempt_voice not in warned_voices:
+                        warned_voices.add(attempt_voice)
+                        logger.write(f"[warn] voice {attempt_voice} unavailable ({e}); trying fallback")
             if idx % 10 == 0:
                 logger.set_progress(55 + int(25 * (idx / max(len(tasks), 1))))
 
     asyncio.run(gen_all())
     logger.write("voice-over synthesized with Edge-TTS")
     return os.path.join(workdir, "tts")
+
+
+# Distinct neural-voice pools per language prefix (female/male mixed). Used to
+# give every character their own voice when num_speakers > 1.
+VOICE_POOLS: dict[str, list[str]] = {
+    "bn": ["bn-BD-NusratNeural", "bn-BD-PradeepNeural", "bn-IN-SwaraNeural", "bn-IN-RanbirNeural"],
+    "en": ["en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural", "en-US-ChristopherNeural", "en-GB-SoniaNeural", "en-GB-RyanNeural"],
+    "hi": ["hi-IN-SwaraNeural", "hi-IN-MadhurNeural"],
+    "ar": ["ar-SA-ZariyahNeural", "ar-SA-HamedNeural", "ar-EG-SalmaNeural", "ar-EG-ShakirNeural"],
+    "es": ["es-ES-ElviraNeural", "es-ES-AlvaroNeural", "es-MX-DaliaNeural", "es-MX-JorgeNeural"],
+    "fr": ["fr-FR-DeniseNeural", "fr-FR-HenriNeural", "fr-CA-SylvieNeural", "fr-CA-AntoineNeural"],
+    "de": ["de-DE-KatjaNeural", "de-DE-ConradNeural", "de-DE-AmalaNeural"],
+    "pt": ["pt-BR-FranciscaNeural", "pt-BR-AntonioNeural", "pt-PT-FernandaNeural"],
+    "ru": ["ru-RU-SvetlanaNeural", "ru-RU-DmitryNeural"],
+    "ja": ["ja-JP-NanamiNeural", "ja-JP-KeitaNeural"],
+    "ko": ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural"],
+    "zh": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunjianNeural", "zh-CN-XiaoyiNeural", "zh-CN-YunxiNeural"],
+    "id": ["id-ID-GadisNeural", "id-ID-ArdiNeural"],
+    "tr": ["tr-TR-EmelNeural", "tr-TR-AhmetNeural"],
+    "vi": ["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"],
+    "ur": ["ur-PK-UzmaNeural", "ur-PK-AsadNeural"],
+    "fa": ["fa-IR-DilaraNeural", "fa-IR-FaridNeural"],
+}
+
+
+def assign_character_voices(
+    segments: list[dict], base_voice: str, num_speakers: int, logger: JobLogger
+) -> None:
+    """Give each segment one of `num_speakers` distinct voices.
+
+    Heuristic diarization (no heavy pyannote dependency): a silence gap longer
+    than ~1.2s is treated as a likely speaker change and we cycle through the
+    requested number of characters. The customer's chosen voice stays
+    character #1 so the result always matches what they picked."""
+    if num_speakers <= 1 or not segments:
+        for seg in segments:
+            seg["voice"] = base_voice
+        return
+
+    prefix = (base_voice.split("-")[0] or "en").lower()
+    pool = VOICE_POOLS.get(prefix)
+    if not pool:
+        # Unknown language: alternate between the chosen voice and a neutral
+        # counterpart so characters still sound different.
+        pool = [base_voice, "en-US-GuyNeural" if "Female" not in base_voice else "en-US-JennyNeural"]
+    # Put the customer's chosen voice first so character #1 matches the UI.
+    ordered = [base_voice] + [v for v in pool if v != base_voice]
+
+    speakers: list[str] = []
+    while len(speakers) < min(num_speakers, max(len(ordered), num_speakers)):
+        nxt = ordered[len(speakers) % len(ordered)]
+        if nxt in speakers:
+            # Pool exhausted; synthesize numbered variants of the base locale.
+            locale = "-".join(base_voice.split("-")[:2]) or "en-US"
+            nxt = f"{locale}-Char{len(speakers) + 1}Neural"
+        speakers.append(nxt)
+
+    current = 0
+    last_end = segments[0].get("start", 0)
+    for seg in segments:
+        gap = float(seg.get("start", 0)) - last_end
+        if gap > 1.2 and len(speakers) > 0:
+            current = (current + 1) % len(speakers)
+        seg["voice"] = speakers[current]
+        last_end = float(seg.get("end", last_end))
+
+    logger.write(f"character voices assigned: {len(speakers)} distinct speakers")
 
 
 def merge_video(video_path: str, tts_dir: str, segments: list[dict], out_path: str, logger: JobLogger) -> str:
@@ -574,6 +654,11 @@ def process_dubbing(job: dict, workdir: str, logger: JobLogger) -> dict:
     segments = translate_segments(segments, job.get("source_language"), job.get("target_language"), logger)
 
     voice = job.get("voice") or "bn-BD-NusratNeural"
+    # Multi-character dubbing: jobs.num_speakers (or options.num_speakers)
+    # gives every detected character a distinct neural voice.
+    opts = job.get("options") if isinstance(job.get("options"), dict) else {}
+    num_speakers = int(job.get("num_speakers") or opts.get("num_speakers") or 1)
+    assign_character_voices(segments, voice, max(1, min(50, num_speakers)), logger)
     tts_dir = synthesize_voiceover(segments, voice, workdir, logger)
 
     final = os.path.join(workdir, "output.mp4")
@@ -613,6 +698,26 @@ def process_animation(job: dict, workdir: str, logger: JobLogger) -> dict:
     pipe.enable_model_cpu_offload()  # works well on the T4
 
     logger.set_progress(40)
+    # Advanced options (jobs.options): steps, guidance and an optional seed so
+    # customers can tune quality / reproducibility from the Studio.
+    opts = job.get("options") if isinstance(job.get("options"), dict) else {}
+    try:
+        steps = max(10, min(50, int(opts.get("steps") or 20)))
+    except (TypeError, ValueError):
+        steps = 20
+    try:
+        guidance = max(1.0, min(21.0, float(opts.get("guidance") or 7.5)))
+    except (TypeError, ValueError):
+        guidance = 7.5
+    seed = opts.get("seed")
+    generator = None
+    if seed not in (None, ""):
+        try:
+            generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        except (TypeError, ValueError):
+            generator = None
+    logger.write(f"animation settings: steps={steps} guidance={guidance} seed={seed or 'random'}")
+
     # Duration-driven: the customer paid per minute of OUTPUT (video_seconds).
     # AnimateDiff generates 16-frame (2s @ 8fps) chunks; chain them to reach
     # the requested length. Capped at 5 minutes to keep runtimes sane.
@@ -621,7 +726,13 @@ def process_animation(job: dict, workdir: str, logger: JobLogger) -> dict:
     logger.write(f"generating ~{target_seconds}s animation ({chunk_count} x 2s chunks)…")
     all_frames: list = []
     for chunk in range(chunk_count):
-        frames = pipe(prompt, num_frames=16, guidance_scale=7.5, num_inference_steps=20).frames[0]
+        frames = pipe(
+            prompt,
+            num_frames=16,
+            guidance_scale=guidance,
+            num_inference_steps=steps,
+            generator=generator,
+        ).frames[0]
         all_frames.extend(frames)
         logger.write(f"chunk {chunk + 1}/{chunk_count} done ({len(all_frames) * 8}s so far)")
     all_frames = all_frames[: max(1, target_seconds * 8)]
