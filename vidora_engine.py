@@ -173,13 +173,13 @@ def install_packages() -> None:
 def _req(method: str, url_path: str, **kwargs):
     """HTTP helper with automatic token refresh on 401 + retry with backoff."""
     timeout = kwargs.pop("timeout", 30)
+    saved_headers = dict(kwargs.pop("headers", {}))
     last_exc = None
     for attempt in range(4):
         try:
-            headers = dict(kwargs.pop("headers", {}))
             r = requests.request(
                 method, f"{SUPABASE_URL}/{url_path}",
-                headers=_auth_headers(headers), timeout=timeout,
+                headers=_auth_headers(saved_headers), timeout=timeout,
                 **kwargs,
             )
         except requests.RequestException as exc:
@@ -239,35 +239,25 @@ def fetch_user_id() -> str:
 # 2. HEARTBEAT - tells the dashboard the engine is online
 # ---------------------------------------------------------------------------
 def heartbeat_loop(user_id: str, stop_event: threading.Event):
-    # Which heartbeat table we touch depends on where the engine runs:
-    #   VIDORA_ENGINE=nvidia  -> nvidia_engines (your own NVIDIA GPU machine)
-    #   VIDORA_NOTEBOOK=kaggle-> kaggle_engines (Kaggle notebook; legacy flag)
-    #   anything else         -> colab_engines (Google Colab)
     engine = os.environ.get("VIDORA_ENGINE") or os.environ.get("VIDORA_NOTEBOOK") or "colab"
     table = {
         "colab": "colab_engines",
         "kaggle": "kaggle_engines",
         "nvidia": "nvidia_engines",
     }.get(engine, "colab_engines")
-    # Immediate heartbeat so the dashboard shows "Connected!" instantly.
-    try:
-        supabase_upsert(
-            table,
-            {"user_id": user_id, "last_seen": now_iso()},
-            "user_id",
-        )
-    except Exception:
-        pass
-    while not stop_event.is_set():
+
+    def _heartbeat():
         try:
-            supabase_upsert(
-                table,
-                {"user_id": user_id, "last_seen": now_iso()},
-                "user_id",
-            )
-        except Exception:
-            pass  # non-critical
+            supabase_upsert(table, {"user_id": user_id, "last_seen": now_iso()}, "user_id")
+        except Exception as exc:
+            log(f"Heartbeat failed: {exc}")
+
+    # Immediate heartbeat so the dashboard shows "Connected!" instantly.
+    _heartbeat()
+    while not stop_event.is_set():
         stop_event.wait(30)  # sleep 30s but wake instantly on shutdown
+        if not stop_event.is_set():
+            _heartbeat()
 
 
 def now_iso() -> str:
