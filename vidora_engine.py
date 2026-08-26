@@ -249,6 +249,15 @@ def heartbeat_loop(user_id: str, stop_event: threading.Event):
         "kaggle": "kaggle_engines",
         "nvidia": "nvidia_engines",
     }.get(engine, "colab_engines")
+    # Immediate heartbeat so the dashboard shows "Connected!" instantly.
+    try:
+        supabase_upsert(
+            table,
+            {"user_id": user_id, "last_seen": now_iso()},
+            "user_id",
+        )
+    except Exception:
+        pass
     while not stop_event.is_set():
         try:
             supabase_upsert(
@@ -258,7 +267,7 @@ def heartbeat_loop(user_id: str, stop_event: threading.Event):
             )
         except Exception:
             pass  # non-critical
-        time.sleep(30)
+        stop_event.wait(30)  # sleep 30s but wake instantly on shutdown
 
 
 def now_iso() -> str:
